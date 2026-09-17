@@ -1,0 +1,1168 @@
+---
+title: "How are socioeconomic factors associated with county-level smoking prevalence in California, accounting for spatial dependence across counties?"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-12-21"
+---
+
+```{r setup, include=FALSE}
+library(rio)
+library(readr)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(sf)
+library(tigris)
+library(zipcodeR)
+library(spdep)
+library(spatialreg)
+library(leaflet)
+library(htmltools)
+library(ggplot2)
+library(kableExtra)
+
+
+data <- read_csv("PLACES__County_Data__GIS_Friendly_Format___2023_release.csv")
+smoking <- data %>%
+  select(StateAbbr, StateDesc, CountyName, CountyFIPS, TotalPopulation, CSMOKING_CrudePrev)
+
+options(tigris_use_cache = TRUE)
+us_counties <- counties(cb = TRUE, year = 2023)
+
+smoking$CountyFIPS <- sprintf("%05s", smoking$CountyFIPS)
+us_counties$GEOID <- as.character(us_counties$GEOID)
+
+us_smoking <- us_counties %>%
+  left_join(smoking, by = c("GEOID" = "CountyFIPS")) %>%
+  filter(!is.na(CSMOKING_CrudePrev)) %>%
+  mutate(CountyName = str_remove(CountyName, " County| Parish") %>% str_squish())
+
+income_raw <- import("lapi1124.xlsx", encoding = "UTF-8")
+income <- income_raw %>%
+  select(CountyName = 1, Income_2023 = 4) %>%
+  filter(!is.na(Income_2023)) %>%
+  mutate(
+    CountyName = str_remove(CountyName, " County| Parish") %>%
+                 str_squish() %>%
+                 str_to_title(),
+    Income_2023 = as.numeric(Income_2023)
+  )
+
+merged_data <- us_smoking %>%
+  left_join(income, by = "CountyName")
+
+west_coast_states <- c("CA")
+merged_data_west <- merged_data %>%
+  filter(StateAbbr %in% west_coast_states)
+
+
+```
+
+## 1. Introduction
+
+In recent years, lung cancer and other smoking-related diseases have continued to pose serious public health challenges. Although the health risks of smoking are widely recognized, smoking prevalence remains uneven across geographic areas. These spatial differences suggest that smoking behavior is shaped not only by individual choices, but also by broader social and economic conditions.
+
+This study focuses on county-level smoking prevalence in California, a state that encompasses a broad spectrum of economic and demographic conditions, with its counties capturing many of the social and behavioral contexts observed across the United States. At the same time, counties in California share strong spatial connections, with economic activity and social norms often extending across county boundaries. Smoking prevalence is explained by a set of variables selected for their intuitive association with smoking behavior, including per capita income, unemployment rate, binge drinking prevalence, median age, and tobacco retailer exposure. These variables capture key socioeconomic and behavioral conditions associated with smoking prevalence within a framework that explicitly incorporates spatial dependence.
+
+To address this analysis, both spatial econometric and machine learning models are applied. Spatial models compare OLS with SAR and CAR specifications to identify the best-fitting model, with spatial dependence capturing how smoking prevalence in one county is influenced by neighboring counties. A random forest model adjusted for geographic location is used to capture nonlinear relationships and assess the relative importance of socioeconomic and behavioral variables. Comparing results from these two approaches provides complementary perspectives on how smoking prevalence is associated with socioeconomic and spatial factors.
+
+
+## 2. Data
+
+The primary dataset used in this study is the PLACES: County Data (GIS Friendly Format, 2023 Release) published by the U.S. Centers for Disease Control and Prevention (CDC). This spatial dataset provides model-based estimates of multiple health indicators for more than 3,100 counties across the United States, with each county identified by its geographic boundary and Federal Information Processing Standard (FIPS) code. The dataset is filtered to include counties in California only. Among the available health indicators, this study focuses on two county-level continuous variables: smoking prevalence, defined as the percentage of adults who currently smoke, and binge drinking prevalence, defined as the percentage of adults engaging in heavy episodic drinking.
+
+County geographic boundaries are obtained from the U.S. Census Bureau’s TIGER/Line County Shapefile (2023), which provides the spatial framework required for mapping and spatial analysis. County boundaries from the shapefile are matched to the PLACES dataset using county GEOID identifiers to ensure consistency between attribute data and spatial geometry.
+
+Graph 1 illustrates the spatial distribution of smoking prevalence across the California state of U.S., where color intensity represents differences in smoking rates and highlights regional variation in health behaviors.
+
+<p style="text-align:left; font-weight:bold;">
+Graph 1. California Smoking Prevalence by County (2023)
+</p>
+
+```{r,echo=FALSE, warning=FALSE, message=FALSE}
+
+west_coast_states <- c("CA")
+west_coast_data <- merged_data %>%
+  filter(StateAbbr %in% west_coast_states)
+
+bins <- c(0, 8, 9, 10, 11, 12, 13, 14, 15, 16,Inf)
+pal_smoke <- colorBin("YlOrRd", domain = west_coast_data$CSMOKING_CrudePrev, bins = bins)
+
+leaflet(merged_data_west) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor   = ~pal_smoke(CSMOKING_CrudePrev),
+    weight      = 0.3,
+    color       = "white",
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight = 1,
+      color  = "#333",
+      bringToFront = TRUE
+    ),
+    label = ~lapply(
+      paste0(
+        "<b>", CountyName, ", ", StateAbbr, "</b><br>",
+        "Smoking Rate: ",
+        round(CSMOKING_CrudePrev, 1), "%"
+      ),
+      HTML
+    )
+  ) %>%
+  addLegend(
+    pal     = pal_smoke,
+    values = ~CSMOKING_CrudePrev,
+    title  = "Smoking Rate (%)",
+    position = "bottomright"
+  )
+
+```
+
+Graph 2 presents the spatial distribution of binge drinking prevalence across counties in California. Darker shades indicate higher rates of heavy episodic drinking, highlighting regional variation across the state. These patterns reflect differences in social and behavioral contexts that provide additional insight into geographic variation in smoking prevalence examined in the subsequent analysis.
+
+<p style="text-align:left; font-weight:bold;">
+Graph 2. California Binge Drinking Prevalence by County (2023)
+</p>
+
+```{r,echo=FALSE, warning=FALSE, message=FALSE}
+
+binge <- data %>%
+  select(StateAbbr, CountyName, CountyFIPS, BINGE_CrudePrev) %>%
+  filter(!is.na(BINGE_CrudePrev))
+
+binge$CountyFIPS <- sprintf("%05s", binge$CountyFIPS)
+merged_binge <- merged_data_west %>%
+  left_join(binge, by = c("StateAbbr", "CountyName", "GEOID" = "CountyFIPS"))
+
+bins_binge <- c(0, 12, 12.5, 13, 13.5, 14, 14.5, 15, 15.5, 16, Inf)
+
+pal_binge <- colorBin(
+  palette = "Greens",                     
+  domain  = merged_binge$BINGE_CrudePrev, 
+  bins    = bins_binge,                  
+  na.color = "transparent"
+)
+
+leaflet(merged_binge) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor   = ~pal_binge(BINGE_CrudePrev),
+    weight      = 0.3,
+    color       = "white",
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight = 1,
+      color  = "#333",
+      bringToFront = TRUE
+    ),
+    label = ~lapply(
+      paste0(
+        "<b>", CountyName, ", ", StateAbbr, "</b><br>",
+        "Binge Drinking Rate: ",
+        round(BINGE_CrudePrev, 1), "%"
+      ),
+      HTML
+    )
+  ) %>%
+  addLegend(
+    pal     = pal_binge,
+    values = ~BINGE_CrudePrev,
+    title  = "Binge Drinking (%)",
+    position = "bottomright"
+  )
+
+
+
+```
+
+Income data are obtained from the Personal Income by County and Metropolitan Area, 2023 release published by the U.S. Bureau of Economic Analysis (BEA). This dataset reports annual per capita personal income for all U.S. counties, expressed in current dollars. County-level income data are merged with the primary dataset using county names to ensure consistency across data sources. The variable Income_2023 represents county-level per capita income.
+
+Graph 3 illustrates the spatial distribution of per capita income across counties across counties in California. Darker shades indicate higher income levels, indicating the regional economic disparities across counties. These spatial patterns highlight areas of relative affluence and economic disadvantage, which associated with geographic variation in smoking prevalence examined in the subsequent analysis.
+
+<p style="text-align:left; font-weight:bold;">
+Graph 3. California Per Capita Income by County (2023)
+</p>
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+west_coast_states <- c("CA") 
+west_coast_data <- merged_data %>%
+  filter(StateAbbr %in% west_coast_states)
+
+bins_income <- c(30000, 40000, 50000, 60000, 70000, 80000, 100000, Inf)
+pal_income <- colorBin("Blues", domain = west_coast_data$Income_2023, bins = bins_income)
+
+leaflet(west_coast_data) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal_income(Income_2023),
+    color = "gray80",
+    weight = 0.3,
+    opacity = 1,
+    fillOpacity = 0.85,
+    label = ~paste0(
+      "<strong>", CountyName, ", ", StateAbbr, "</strong><br/>",
+      "Income (2023): $",
+      formatC(Income_2023, format = "f", big.mark = ",", digits = 0)
+    ) %>% lapply(HTML),
+    highlight = highlightOptions(
+      weight = 1.2,
+      color = "black",
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal_income,
+    values = ~Income_2023,
+    title = "Per Capita Income (USD)",
+    opacity = 0.8,
+    position = "bottomright",
+    labFormat = labelFormat(prefix = "$", big.mark = ",")
+  ) %>%
+  setView(lng = -120, lat = 37, zoom = 5)
+
+
+```
+
+Unemployment data are obtained from the County-level Data Sets – Unemployment (2023) released by the U.S. Department of Agriculture’s Economic Research Service (USDA ERS). The dataset reports annual county-level unemployment rates for U.S. counties, defined as the percentage of the labor force that is unemployed and actively seeking work. For this study, the data are restricted to counties in California and merged with the primary dataset using county GEOID identifiers to ensure consistent spatial alignment. 
+
+Graph 4 illustrates the spatial distribution of unemployment rates across counties in California. Darker shades indicate higher unemployment levels, revealing huge regional differences in labor market conditions across the state. Unemployment is defined as the percentage of the civilian labor force that is unemployed and actively seeking work. These spatial patterns motivate the inclusion of unemployment as an indicator of local labor market conditions in explaining regional variation in smoking prevalence in the subsequent analysis.
+
+<p style="text-align:left; font-weight:bold;">
+Graph 4. California Unemployment Rate by County (2023)
+</p>
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+unemployment_data <- read_xlsx(
+  "UnemploymentReport.xlsx",
+  skip = 2,
+  col_names = TRUE
+)
+
+unemployment_2023 <- unemployment_data %>%
+  rename(
+    GEOID = FIPS,
+    Unemployment_2023 = `2023`
+  ) %>%
+  mutate(
+    GEOID = sprintf("%05s", GEOID),
+    Unemployment_2023 = as.numeric(Unemployment_2023)
+  ) %>%
+  filter(!is.na(Unemployment_2023))
+
+unemployment_map <- unemployment_2023 %>%
+  select(GEOID, Unemployment_2023)
+
+merged_unemployment <- merged_data_west %>%
+  left_join(unemployment_map, by = "GEOID")
+
+bins_unemp <- c(0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, Inf)
+
+pal_unemp <- colorBin(
+  palette  = "Reds",
+  domain   = merged_unemployment$Unemployment_2023,
+  bins     = bins_unemp,
+  na.color = "transparent"
+)
+
+
+leaflet(merged_unemployment) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor   = ~pal_unemp(Unemployment_2023),
+    weight      = 0.3,
+    color       = "white",
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(
+      weight = 1,
+      color  = "#333",
+      bringToFront = TRUE
+    ),
+    label = ~lapply(
+      paste0(
+        "<b>", CountyName, ", ", StateAbbr, "</b><br>",
+        "Unemployment Rate (2023): ",
+        round(Unemployment_2023, 1), "%"
+      ),
+      HTML
+    )
+  ) %>%
+  addLegend(
+    pal     = pal_unemp,
+    values = ~Unemployment_2023,
+    title  = "Unemployment Rate (%)",
+    position = "bottomright"
+  )
+
+```
+
+Median age data are obtained from the American Community Survey (ACS) 5-Year Estimates (2019–2023) released by the U.S. Census Bureau. The dataset reports county-level median age of the population, defined as the age that divides the population into two numerically equal groups. For this study, the data are restricted to counties in California and merged with the primary dataset using county GEOID identifiers to ensure consistent spatial alignment.
+
+Graph 5 illustrates the spatial distribution of median age across counties in California. Darker shades represent higher median age values, highlighting regional differences in population age structure across the state. These patterns provide important social and demographic context for understanding geographic variation in smoking prevalence examined in the subsequent analysis.
+
+<p style="text-align:left; font-weight:bold;">
+Graph 5. California Median Age by County (2023)
+</p>
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(readr)
+library(dplyr)
+library(stringr)
+
+median_age_data <- read_csv(
+  "California_County.csv",
+  col_names = TRUE
+)
+
+median_age_2023 <- median_age_data %>%
+  filter(`Date:Median_Age_Person` == 2023) %>%
+  mutate(
+    GEOID = str_sub(placeDcid, -5),
+    GEOID = sprintf("%05s", GEOID),
+    Median_Age_2023 = as.numeric(`Value:Median_Age_Person`)
+  ) %>%
+  select(GEOID, Median_Age_2023) %>%
+  filter(!is.na(Median_Age_2023))
+
+merged_median_age <- merged_data_west %>%
+  left_join(median_age_2023, by = "GEOID")
+
+bins_age <- c(20, 25, 30, 35, 40, 45, 50, 55, 60, Inf)
+
+pal_age <- colorBin(
+  palette  = "Blues",
+  domain   = merged_median_age$Median_Age_2023,
+  bins     = bins_age,
+  na.color = "transparent"
+)
+
+leaflet(merged_median_age) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal_age(Median_Age_2023),
+    color = "gray80",
+    weight = 0.3,
+    opacity = 1,
+    fillOpacity = 0.85,
+    label = ~paste0(
+      "<strong>", CountyName, ", ", StateAbbr, "</strong><br/>",
+      "Median Age (2023): ",
+      round(Median_Age_2023, 1)
+    ) %>% lapply(HTML),
+    highlightOptions = highlightOptions(
+      weight = 1.2,
+      color = "black",
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    pal = pal_age,
+    values = ~Median_Age_2023,
+    title = "Median Age (2023)",
+    position = "bottomright"
+  ) %>%
+  setView(lng = -120, lat = 37, zoom = 5)
+
+
+
+```
+
+Tobacco retailer data are obtained from the California Department of Tax and Fee Administration (CDTFA) California Cigarette & Tobacco Products Licensees dataset for retailers. The raw file provides licensed retailer records with ZIP code information. Retailer ZIP codes are first cleaned by extracting five-digit ZIP values. To aggregate retailers to the county level, ZIP codes are linked to county Federal Information Processing Standard (FIPS) codes using a ZIP–county FIPS crosswalk dataset. Retailer records are then grouped by county FIPS to compute the total number of licensed tobacco retailers per county. The resulting county-level retailer counts are merged into the primary dataset using county GEOID identifiers to ensure consistent spatial alignment.
+
+Graph 6 displays the spatial distribution of licensed tobacco retailer locations across California counties, with each point representing an individual retailer. The map provides a descriptive view of the geographic arrangement of retailers and highlights areas where retailers appear more or less spatially clustered. This point-level visualization serves as a preliminary illustration of tobacco retail availability and motivates subsequent analyses that quantify retailer exposure and its association with smoking prevalence.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+tobacco_raw <- read_xlsx(
+  "california_tobacco_retailers.xlsx",
+  skip = 5,
+  col_names = TRUE
+)
+
+tobacco_raw <- tobacco_raw %>%
+  mutate(
+    Zip = str_extract(as.character(Zip), "\\d{5}")
+  ) %>%
+  filter(!is.na(Zip))
+
+
+
+###########################################################
+
+
+zip_to_fips <- read_csv("ZIP-COUNTY-FIPS_2017-06.csv")
+
+zip_to_fips <- zip_to_fips %>%
+  mutate(
+    ZIP = str_extract(as.character(ZIP), "\\d{5}"),
+    STCOUNTYFP = str_pad(STCOUNTYFP, width = 5, pad = "0")
+  )
+
+tobacco_zip <- tobacco_raw %>%
+  left_join(zip_to_fips, by = c("Zip" = "ZIP"))
+
+tobacco_count <- tobacco_zip %>%
+  group_by(STCOUNTYFP) %>%
+  summarize(tobacco_retailer_count = n())
+
+merged_data <- merged_data %>%
+  left_join(tobacco_count, by = c("GEOID" = "STCOUNTYFP"))
+
+merged_data$tobacco_retailer_count[is.na(merged_data$tobacco_retailer_count)] <- 0
+
+```
+
+<p style="text-align:left; font-weight:bold;">
+Graph 6. California Tobacco Retailer Locations
+</p>
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+west_coast_states <- c("CA")
+
+tobacco_points <- tobacco_raw %>%
+  mutate(
+    Zip = str_extract(as.character(Zip), "\\d{5}")
+  ) %>%
+  filter(!is.na(Zip)) %>%
+  left_join(zipcodeR::zip_code_db, by = c("Zip" = "zipcode")) %>%
+  filter(state %in% west_coast_states) %>%
+  
+  rename(
+    lon = lng,
+    lat = lat
+  ) %>%
+  filter(!is.na(lon), !is.na(lat))
+
+tobacco_sf_plot <- tobacco_points %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircleMarkers(
+    data = tobacco_points,
+    lng = ~lon,
+    lat = ~lat,
+    radius = 2,
+    fillColor = "red",
+    fillOpacity = 0.6,
+    color = NA,
+    stroke = FALSE,
+    popup = ~paste0(
+      "<strong>", Taxpayer, "</strong><br/>",
+      DBA, "<br/>",
+      City, ", ", State, " ", Zip
+    )
+  ) %>%
+  setView(lng = -120, lat = 37, zoom = 5)
+
+
+
+
+```
+
+
+## 3. Method
+
+This study applies two complementary analytical perspectives to examine county-level smoking prevalence. Spatial models are used to explicitly model spatial dependence across neighboring counties and estimate linear trends between smoking prevalence and explanatory variables after accounting for the spatial relationships. In parallel, a machine learning approach is applied to flexibly capture nonlinear relationships and assess the relative importance of economic, social, and demographic factors.
+
+### 3.0 Pre-Model Diagnostics
+
+Before model estimation, exploratory diagnostics are conducted to assess both multicollinearity associations and spatial dependence in county-level smoking prevalence. The correlation matrix (Graph 7) indicates that smoking prevalence is moderately correlated with several explanatory variables, including unemployment, binge drinking prevalence, and median age, while correlations among the explanatory variables themselves remain relatively small in magnitude. This suggests that multicollinearity is unlikely to be a major concern at this stage, allowing spatial models to be applied consequently.
+
+In contrast, the Moran’s I test reveals a very strong and statistically significant positive spatial autocorrelation in smoking prevalence where it takes value of 0.88 with p value of 0, indicating substantial spatial clustering across neighboring counties. As a result, it suggests that spatial dependence is a dominant feature of the data and must be explicitly accounted for in subsequent modeling.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(ggcorrplot)
+library(dplyr)
+library(sf)
+
+ca_counties <- counties(state = "CA", cb = TRUE, year = 2023) %>%
+  st_transform(3310)
+
+analysis_sf_base <- ca_counties %>%
+  st_transform(3310) %>%
+  left_join(
+    merged_data_west %>% st_drop_geometry(),
+    by = "GEOID"
+  ) %>%
+  left_join(
+    merged_binge %>%
+      st_drop_geometry() %>%
+      select(GEOID, BINGE_CrudePrev),
+    by = "GEOID"
+  ) %>%
+  left_join(
+    unemployment_2023 %>%
+      select(GEOID, Unemployment_2023),
+    by = "GEOID"
+  ) %>%
+  left_join(
+    median_age_2023 %>%
+      select(GEOID, Median_Age_2023),
+    by = "GEOID"
+  ) %>%
+  mutate(
+    CSMOKING_CrudePrev = as.numeric(CSMOKING_CrudePrev),
+    Income_2023        = as.numeric(Income_2023),
+    BINGE_CrudePrev    = as.numeric(BINGE_CrudePrev),
+    Unemployment_2023  = as.numeric(Unemployment_2023),
+    Median_Age_2023    = as.numeric(Median_Age_2023)
+  ) %>%
+  filter(
+    !is.na(CSMOKING_CrudePrev),
+    !is.na(Income_2023),
+    !is.na(BINGE_CrudePrev),
+    !is.na(Unemployment_2023),
+    !is.na(Median_Age_2023)
+  ) %>%
+  st_make_valid()
+
+corr_df <- analysis_sf_base %>%
+  st_drop_geometry() %>%
+  select(
+    CSMOKING_CrudePrev,
+    Income_2023,
+    Unemployment_2023,
+    BINGE_CrudePrev,
+    Median_Age_2023
+  )
+
+corr_mat <- cor(corr_df, use = "complete.obs")
+
+ggcorrplot(
+  corr_mat,
+  type = "lower",
+  lab = TRUE,
+  lab_size = 3,
+  method = "circle",
+  colors = c("blue", "white", "red"),
+  title = "Graph 7: Correlation Matrix of County-Level Variables"
+) +
+  theme(
+    plot.title = element_text(hjust = 0),
+    plot.title.position = "plot"
+  )
+
+
+nb_queen_base <- poly2nb(analysis_sf_base, queen = TRUE)
+listw_queen_base <- nb2listw(nb_queen_base, style = "W", zero.policy = TRUE)
+
+moran_smoking <- moran.test(
+  analysis_sf_base$CSMOKING_CrudePrev,
+  listw_queen_base,
+  zero.policy = TRUE
+)
+
+moran_summary <- tibble(
+  Moran_I     = moran_smoking$estimate[["Moran I statistic"]],
+  Expectation = moran_smoking$estimate[["Expectation"]],
+  Variance    = moran_smoking$estimate[["Variance"]],
+  p_value     = moran_smoking$p.value
+)
+
+knitr::kable(
+  moran_summary,
+  caption = "<strong style='text-align:center;'>Table 1: Global Moran’s I Test for Smoking Prevalence</strong>",
+  format = "html",
+  escape = FALSE
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+Additionally, for the point data about locations of tobacco retailers, a density-based clustering approach is being applied. It is used to assess whether the locations of retailers form spatial clusters. HDBSCAN is chosen because it accommodates heterogeneous point densities without requiring a hyperparameter concerning the number of clusters. What's more, it identifies both clusters and noise which helps providing insight into the stability and separation of retailer groupings.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(sf)
+library(dbscan)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+tobacco_sf <- tobacco_points %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(3310)
+
+coords <- st_coordinates(tobacco_sf)
+
+hdb <- hdbscan(
+  coords,
+  minPts = 80
+)
+
+tobacco_sf$cluster <- hdb$cluster
+tobacco_sf$prob    <- hdb$membership_pro
+
+n_clusters <- length(unique(tobacco_sf$cluster[tobacco_sf$cluster != 0]))
+cluster_colors <- hue_pal(l = 65, c = 100)(n_clusters)
+
+ggplot() +
+  geom_sf(
+    data = tobacco_sf %>% filter(cluster == 0),
+    color = "grey80",
+    size  = 0.3,
+    alpha = 0.2
+  ) +
+  geom_sf(
+    data = tobacco_sf %>% filter(cluster != 0),
+    aes(color = factor(cluster)),
+    size = 0.6,
+    alpha = 0.9
+  ) +
+  scale_color_manual(values = cluster_colors) +
+  theme_minimal() +
+  theme(
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Graph 8: HDBSCAN-Identified Tobacco Retail Clusters",
+    subtitle = "Density-based clustering with automatic noise detection (minPts = 80)"
+  )
+
+```
+
+The HDBSCAN result shows that the localized clusters exists, but they vary substantially in size and density. Many retailers are classified as noise, suggesting that the spatial distribution cannot be adequately summarized by a small number of discrete clusters. Based on this diagnostic evidence, tobacco retail availability is represented using a continuous exposure measure rather than a discrete cluster indicator. A point-to-county Gaussian kernel is constructed by aggregating the influence of all tobacco retailer locations to each county centroid. The influence of each retailer decreases with distance. This kernel matrix converts point retailer locations into an areal measure at the county level, allowing tobacco retail data to be directly incorporated into subsequent spatial regression and machine learning models.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(sf)
+library(dplyr)
+library(spdep)
+library(units)
+
+options(tigris_use_cache = TRUE)
+
+ca_counties <- counties(state = "CA", cb = TRUE, year = 2023) %>%
+  st_transform(3310)
+
+merged_sf <- ca_counties %>%
+  left_join(
+    merged_data %>% st_drop_geometry(),
+    by = "GEOID"
+  )
+
+centroids <- st_centroid(merged_sf)
+
+dist_cc <- st_distance(centroids)
+dist_cc <- units::drop_units(dist_cc)
+dist_cc <- matrix(as.numeric(dist_cc), nrow = nrow(centroids))
+
+h <- 100000  # 100 km
+
+kernel_mat <- exp(-(dist_cc^2) / (2 * h^2))
+kernel_mat <- kernel_mat / rowSums(kernel_mat)
+
+kernel_listw <- mat2listw(kernel_mat, style = "W")
+
+tobacco_sf <- tobacco_points %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(3310)
+
+dist_cp <- st_distance(centroids, tobacco_sf)
+dist_cp <- units::drop_units(dist_cp)
+dist_cp <- as.matrix(dist_cp)
+
+kernel_weights_pt <- exp(-(dist_cp^2) / (2 * h^2))
+
+merged_sf$kernel_tobacco <- rowSums(kernel_weights_pt)
+
+
+```
+
+### 3.1 Spatial Analysis
+
+Building on the pre-model diagnostics and the construction of county-level tobacco retail exposure measures, the analysis proceeds to formal model estimation. Five modeling approaches are estimated and compared to examine county-level smoking prevalence under different assumptions about spatial dependence.
+
+#### 1. Ordinary Least Squares (OLS)
+$$
+y_i = \mathbf{X}_i \boldsymbol{\beta} + \varepsilon_i,
+\qquad
+\varepsilon_i \sim \text{i.i.d. } (0, \sigma^2)
+$$
+
+The OLS model serves as a baseline model which assumes independence across counties and didn't catch any spatial patterns. It provides a reference level for evaluating whether spatial dependence is present and whether more complex spatial models are necessary.
+
+#### 2. SAR Lag
+$$
+\mathbf{y} = \rho \mathbf{W}\mathbf{y} + \mathbf{X}\boldsymbol{\beta} + \boldsymbol{\varepsilon}
+$$
+
+The SAR Lag model captures the outcome spatial dependence by allowing the dependent variable in one spatial unit to be directly influenced by outcomes in neighboring units, or in other words, it captures the spillover effects from neighborhoods. In this study, this specification accounts for the possibility that smoking prevalence in a county is shaped by smoking behavior in surrounding counties through spatial spillover effects.
+
+#### 3. SAR Error
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \mathbf{u},
+\qquad
+\mathbf{u} = \lambda \mathbf{W}\mathbf{u} + \boldsymbol{\varepsilon}
+$$
+
+The SAR Error model captures spatial dependence arising from unobserved factors that are correlated across neighboring spatial units. In this study, it accounts for spatially structured omitted influences that may jointly affect smoking prevalence across nearby counties.
+
+#### 4. SAR Lag-Error
+$$
+\mathbf{y} = \rho \mathbf{W}\mathbf{y} + \mathbf{X}\boldsymbol{\beta} + \mathbf{u},
+\qquad
+\mathbf{u} = \lambda \mathbf{W}\mathbf{u} + \boldsymbol{\varepsilon}
+$$
+
+The SAR Lag–Error model allows for spatial dependence both in the outcome and in the unobserved component, capturing direct spillover effects as well as spatially correlated latent influences. It can be viewed as a joint specification that combines the features of both the SAR lag and SAR error models.
+
+#### 5. CAR
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \boldsymbol{\phi} + \boldsymbol{\varepsilon},
+\qquad
+\boldsymbol{\phi} \sim \text{CAR}(\mathbf{W}),
+\qquad
+\boldsymbol{\varepsilon} \sim \mathcal{N}(0, \sigma^2 \mathbf{I})
+$$
+
+The CAR model captures spatial dependence through random effects that are conditionally correlated across neighboring spatial units. In this study, it accounts for spatially structured heterogeneity in smoking prevalence across neighboring counties.
+
+
+These spatial models are estimated and compared to evaluate how different forms of spatial dependence are captured in the data. The competing models are compared using the AIC and the p-values from Moran’s I tests to assess model fit and residual spatial dependence. Residual diagnostics are subsequently conducted to assess whether spatial spillover effects, spatially correlated unobserved factors, or conditionally correlated random effects. The selected model is then used to interpret linear covariate effects and their statistical significance, forming the basis for the spatial analysis conclusions.
+
+
+### 3.2 Machine Learning Analysis
+
+Prior to formal spatial model estimation, a machine learning diagnostic analysis is conducted to explore potential nonlinear relationships and interaction effects among the selected covariates. Given the limited number of explanatory variables and the possibility of nonlinear associations with smoking prevalence, a Random Forest approach is adopted. This method flexibly captures nonlinearities and higher-order interactions without requiring explicit model specification, while remaining robust to multicollinearity and scale differences across variables.
+
+The earlier exploratory analysis indicates a strong and statistically significant spatial clustering pattern in smoking prevalence, as evidenced by the Moran’s I test. To account for this spatial structure within the machine learning framework, geographic coordinates are explicitly included as predictors in the Random Forest model. Incorporating longitude and latitude allows the model to absorb residual spatial patterns that may otherwise confound the relationships between smoking prevalence and observed covariates. Moreover, the same set of explanatory variables used in the spatial regression models is applied here. This design enables the machine learning analysis to isolate nonlinear and interaction effects while controlling for latent spatial structure.
+
+After fitting the Random Forest model, variable importance is evaluated using the percentage increase in mean squared error to identify predictors that contribute most to predictive performance. A Moran’s I test is then applied to the Random Forest residuals to assess whether spatial autocorrelation persists after accounting for nonlinear relationships and geographic location. Finally, partial dependence plots are used to examine the functions of key predictors after detrending the spatial effects, providing diagnostic evidence on potential nonlinear relationships.
+
+The results from the machine learning diagnostics are subsequently compared with those from the spatial regression analysis. This comparison focuses on whether variables that are insignificant in the spatial models also exhibit low importance in the machine learning framework, and on whether linear specifications adequately capture the contribution of key predictors. While machine learning methods can flexibly model nonlinear relationships, they do not explicitly account for spatial dependence, highlighting the complementary strengths and limitations of the two approaches.
+
+
+## 4. Results
+
+### 4.1 Spatial Analysis Results
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(sf)
+library(dplyr)
+library(spdep)
+library(spatialreg)
+library(readr)
+library(readxl)
+library(stringr)
+library(tibble)
+
+analysis_sf <- merged_sf %>%
+  st_make_valid() %>%
+  left_join(
+    merged_binge %>%
+      st_drop_geometry() %>%
+      select(GEOID, BINGE_CrudePrev),
+    by = "GEOID"
+  ) %>%
+  left_join(
+    unemployment_2023 %>%
+      select(GEOID, Unemployment_2023),
+    by = "GEOID"
+  ) %>%
+  left_join(
+    median_age_2023 %>%
+      select(GEOID, Median_Age_2023),
+    by = "GEOID"
+  ) %>%
+  mutate(
+    CSMOKING_CrudePrev = as.numeric(CSMOKING_CrudePrev),
+    BINGE_CrudePrev    = as.numeric(BINGE_CrudePrev),
+    Income_2023        = as.numeric(Income_2023),
+    kernel_tobacco     = as.numeric(kernel_tobacco),
+    Unemployment_2023  = as.numeric(Unemployment_2023),
+    Median_Age_2023    = as.numeric(Median_Age_2023)
+  ) %>%
+  filter(
+    !is.na(CSMOKING_CrudePrev),
+    !is.na(BINGE_CrudePrev),
+    !is.na(Income_2023),
+    !is.na(kernel_tobacco),
+    !is.na(Unemployment_2023),
+    !is.na(Median_Age_2023)
+  )
+
+nb_queen <- poly2nb(analysis_sf, queen = TRUE)
+listw_queen <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+
+lm_fit <- lm(
+  CSMOKING_CrudePrev ~ Income_2023 + BINGE_CrudePrev + kernel_tobacco +
+    Unemployment_2023 + Median_Age_2023,
+  data = analysis_sf
+)
+
+sar_lag_fit <- lagsarlm(
+  CSMOKING_CrudePrev ~ Income_2023 + BINGE_CrudePrev + kernel_tobacco +
+    Unemployment_2023 + Median_Age_2023,
+  data = analysis_sf,
+  listw = listw_queen,
+  zero.policy = TRUE
+)
+
+sar_err_fit <- errorsarlm(
+  CSMOKING_CrudePrev ~ Income_2023 + BINGE_CrudePrev + kernel_tobacco +
+    Unemployment_2023 + Median_Age_2023,
+  data = analysis_sf,
+  listw = listw_queen,
+  zero.policy = TRUE
+)
+
+sar_lagerr_fit <- sacsarlm(
+  CSMOKING_CrudePrev ~ Income_2023 + BINGE_CrudePrev + kernel_tobacco +
+    Unemployment_2023 + Median_Age_2023,
+  data  = analysis_sf,
+  listw = listw_queen,
+  zero.policy = TRUE
+)
+
+car_fit <- spautolm(
+  CSMOKING_CrudePrev ~ Income_2023 + BINGE_CrudePrev + kernel_tobacco +
+    Unemployment_2023 + Median_Age_2023,
+  data = analysis_sf,
+  listw = listw_queen,
+  family = "CAR",
+  zero.policy = TRUE
+)
+
+analysis_sf$resid_lm     <- residuals(lm_fit)
+analysis_sf$resid_lag    <- residuals(sar_lag_fit)
+analysis_sf$resid_err    <- residuals(sar_err_fit)
+analysis_sf$resid_lagerr <- residuals(sar_lagerr_fit)
+analysis_sf$resid_car    <- residuals(car_fit)
+
+moran_lm     <- moran.test(analysis_sf$resid_lm,     listw_queen, zero.policy = TRUE)
+moran_lag    <- moran.test(analysis_sf$resid_lag,    listw_queen, zero.policy = TRUE)
+moran_err    <- moran.test(analysis_sf$resid_err,    listw_queen, zero.policy = TRUE)
+moran_lagerr <- moran.test(analysis_sf$resid_lagerr, listw_queen, zero.policy = TRUE)
+moran_car    <- moran.test(analysis_sf$resid_car,    listw_queen, zero.policy = TRUE)
+
+aic_table <- data.frame(
+  Model = c("OLS", "SAR Lag", "SAR Error", "SAR Lag-Error", "CAR"),
+  AIC   = c(
+    AIC(lm_fit),
+    AIC(sar_lag_fit),
+    AIC(sar_err_fit),
+    AIC(sar_lagerr_fit),
+    AIC(car_fit)
+  )
+)
+
+moran_to_row <- function(moran_obj) {
+  tibble(
+    Moran_I     = unname(moran_obj$estimate[["Moran I statistic"]]),
+    Expectation = unname(moran_obj$estimate[["Expectation"]]),
+    Variance    = unname(moran_obj$estimate[["Variance"]]),
+    p_value     = moran_obj$p.value
+  )
+}
+
+diagnostic_table <- bind_rows(
+  moran_to_row(moran_lm)     %>% mutate(Model = "OLS"),
+  moran_to_row(moran_lag)    %>% mutate(Model = "SAR Lag"),
+  moran_to_row(moran_err)    %>% mutate(Model = "SAR Error"),
+  moran_to_row(moran_lagerr) %>% mutate(Model = "SAR Lag-Error"),
+  moran_to_row(moran_car)    %>% mutate(Model = "CAR")
+) %>%
+  left_join(aic_table, by = "Model") %>%
+  select(Model, Moran_I, Expectation, Variance, p_value, AIC)
+
+```
+
+```{r, echo=FALSE, warning=FALSE, results='asis'}
+library(kableExtra)
+
+knitr::kable(
+  diagnostic_table,
+  caption = "<strong style='text-align:center;'>Table 2: Residual Moran’s I Diagnostics and AIC Comparison Across Models</strong>",
+  format = "html",
+  escape = FALSE
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+Table 2 summarizes residual Moran’s I statistics and AIC values for the OLS and spatial regression models. The OLS model exhibits strong and significant residual spatial autocorrelation where Moran's I is significantly different from 0, indicating that spatial dependence in smoking prevalence cannot be modelled through linear regressions. It serves as a non-spatial baseline for subsequent spatial models.
+
+In contrast, all spatial models substantially reduce residual spatial autocorrelation relative to the non-spatial specification, with residual Moran’s I values close to zero and statistically insignificant p-values. This indicates that explicitly modeling spatial dependence effectively accounts for the clustering observed in the raw smoking prevalence data and produces spatially uncorrelated residuals. The model performance is further evaluated using the AIC to balance goodness of fit and model complexity. Among the four spatial specifications, the SAR Lag–Error model achieves the lowest AIC, suggesting superior explanatory power relative to alternative spatial formulations.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+analysis_sf$resid_lagerr <- residuals(sar_lagerr_fit)
+
+plot(
+  analysis_sf["resid_lagerr"],
+  main = "Graph 9: Residuals from SAR Lag-Error Model"
+)
+
+
+```
+
+The residual map from the SAR Lag–Error model (Graph 9) shows no evident large-scale spatial clustering, with residuals broadly dispersed across counties. Both positive and negative residuals appear spatially mixed rather than concentrated in specific clusters, indicating that the model has effectively captured the dominant spatial structure in smoking prevalence. This pattern is consistent with the Moran’s I residual diagnostics, supporting the adequacy of the selected spatial specification.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(broom)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+fmt_est <- function(x) formatC(x, format = "e", digits = 3)
+fmt_p   <- function(p) ifelse(p < 0.001, "<0.001", formatC(p, format = "f", digits = 4))
+
+coef_tbl <- tidy(sar_lagerr_fit) %>%
+  filter(!term %in% c("rho", "lambda")) %>%
+  mutate(
+    term = recode(term,
+                  "(Intercept)" = "Intercept",
+                  "Income_2023" = "Income (2023)",
+                  "BINGE_CrudePrev" = "Binge Drinking Prevalence",
+                  "kernel_tobacco" = "Tobacco Retail Exposure (Kernel)",
+                  "Unemployment_2023" = "Unemployment Rate (2023)",
+                  "Median_Age_2023" = "Median Age (2023)"),
+    Estimate  = fmt_est(estimate),
+    `Std. Error` = fmt_est(std.error),
+    `z-value` = formatC(statistic, format = "f", digits = 3),
+    `p-value` = fmt_p(p.value)
+  ) %>%
+  select(term, Estimate, `Std. Error`, `z-value`, `p-value`)
+
+spatial_tbl <- tidy(sar_lagerr_fit) %>%
+  filter(term %in% c("rho", "lambda")) %>%
+  mutate(
+    term = recode(term,
+                  "rho" = "Spatial Lag (ρ)",
+                  "lambda" = "Spatial Error (λ)"),
+    Estimate  = fmt_est(estimate),
+    `Std. Error` = fmt_est(std.error),
+    `z-value` = formatC(statistic, format = "f", digits = 3),
+    `p-value` = fmt_p(p.value)
+  ) %>%
+  select(term, Estimate, `Std. Error`, `z-value`, `p-value`)
+
+full_tbl <- bind_rows(coef_tbl, spatial_tbl)
+
+kable(
+  full_tbl,
+  col.names = c("Variable", "Estimate", "Std. Error", "z-value", "p-value"),
+  caption = "Table 3: SAR Lag–Error Model Estimates",
+  align = "lcccc",
+  booktabs = TRUE,
+  escape = FALSE
+) %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+The SAR Lag–Error model results indicate that several socioeconomic variables exhibit statistically significant associations with smoking prevalence. Unemployment rate shows a positive and highly significant effect, suggesting that higher unemployment is associated with increased smoking prevalence and represents an important contributing factor. Income and tobacco retail exposure both display statistically significant negative coefficients, indicating that higher income levels and greater retailer accessibility are associated with lower smoking rates after accounting for spatial dependence. Binge drinking prevalence also shows a negative and statistically significant association with smoking prevalence, but it is less intuitive since more binge drinking would typically lead to more smoking. One possible explanation is that part of its association is absorbed by the spatial dependence terms in the model. In contrast, median age does not exhibit a statistically significant association with smoking prevalence, suggesting limited explanatory power after controlling for other covariates and spatial structure.
+
+The spatial dependence parameters are both statistically significant. The spatial lag parameter rou is negative and significant, indicating the presence of outcome-level spatial interaction across neighboring counties. The spatial error parameter lambda is positive and close to one, reflecting strong spatial correlation in unobserved factors affecting smoking prevalence. These results suggest that both spatial spillover effects and spatially structured unobserved influences play an important role in shaping county-level smoking prevalence.
+
+
+### 4.2 Machine Learning Analysis Results
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(randomForest)
+library(dplyr)
+library(pdp)
+library(ggplot2)
+library(sf)
+
+ml_df <- analysis_sf %>%
+  st_transform(4326) %>%
+  st_centroid() %>%
+  mutate(
+    longitude = st_coordinates(.)[,1],
+    latitude  = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(
+    CSMOKING_CrudePrev,
+    Income_2023,
+    Unemployment_2023,
+    BINGE_CrudePrev,
+    kernel_tobacco,
+    Median_Age_2023,
+    longitude,
+    latitude
+  ) %>%
+  na.omit()
+
+rf_fit <- randomForest(
+  CSMOKING_CrudePrev ~ .,
+  data = ml_df,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+varImpPlot(
+  rf_fit,
+  type = 1,
+  main = "Graph 10: Random Forest Variable Importance \n(%Increase MSE)"
+)
+
+
+```
+
+Graph 10 represents the Random Forest variable importance measured by the percentage increase in mean squared error after including geographic coordinates to account for underlying spatial patterns. Under this specification, unemployment rate emerges as the most important predictor, followed by longitude and tobacco retail exposure, indicating that both socioeconomic conditions and spatial location contribute substantially to explaining variation in smoking prevalence. Income and latitude exhibit moderate importance, while median age and binge drinking prevalence are relatively less influential in the machine learning framework. However, all variables provide meaningful explanatory power in capturing patterns of smoking prevalence once spatial structure is accounted for due to their large contributions in the increases of MSE.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+rf_pred <- predict(rf_fit, newdata = ml_df)
+
+rf_resid <- ml_df$CSMOKING_CrudePrev - rf_pred
+
+nb_queen_ml <- poly2nb(analysis_sf, queen = TRUE)
+listw_queen_ml <- nb2listw(nb_queen_ml, style = "W", zero.policy = TRUE)
+
+moran_rf <- moran.test(rf_resid, listw_queen_ml, zero.policy = TRUE)
+
+moran_summary_rf <- tibble(
+  Moran_I     = moran_rf$estimate[["Moran I statistic"]],
+  Expectation = moran_rf$estimate[["Expectation"]],
+  Variance    = moran_rf$estimate[["Variance"]],
+  p_value     = moran_rf$p.value
+)
+
+knitr::kable(
+  moran_summary_rf,
+  caption = "<strong style='text-align:center;'>Table 4: Moran’s I Test on Random Forest Residuals</strong>",
+  format = "html",
+  escape = FALSE
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+The Moran’s I statistic for the Random Forest residuals is positive with value of 0.1 and statistically significant, indicating the presence of residual spatial autocorrelation. This suggests that despite accounting for nonlinear relationships and geographic coordinates, the machine learning model does not fully capture the underlying spatial dependence in smoking prevalence.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(pdp)
+library(ggplot2)
+
+pdp_binge <- pdp::partial(
+  rf_fit,
+  pred.var = "BINGE_CrudePrev",
+  train = ml_df,
+  grid.resolution = 20
+)
+
+
+pdp_tobacco <- pdp::partial(
+  rf_fit,
+  pred.var = "kernel_tobacco",
+  train = ml_df,
+  grid.resolution = 20
+)
+
+pdp_income <- pdp::partial(
+  rf_fit,
+  pred.var = "Income_2023",
+  train = ml_df,
+  grid.resolution = 20
+)
+
+
+pdp_unemp <- pdp::partial(
+  rf_fit,
+  pred.var = "Unemployment_2023",
+  train = ml_df,
+  grid.resolution = 20
+)
+
+pdp_age <- pdp::partial(
+  rf_fit,
+  pred.var = "Median_Age_2023",
+  train = ml_df,
+  grid.resolution = 20
+)
+
+p_age <- autoplot(pdp_age) +
+  labs(
+    title = "Median Age",
+    x = "Median Age",
+    y = "Predicted Smoking Rate"
+  )
+p_binge <- autoplot(pdp_binge) +
+  labs(
+    title = "Binge Drinking",
+    x = "Binge Drinking Prevalence (%)",
+    y = "Predicted Smoking Rate"
+  )
+
+p_tobacco <- autoplot(pdp_tobacco) +
+  labs(
+    title = "Tobacco Retail Exposure",
+    x = "Kernel-Smoothed Retailer Exposure",
+    y = "Predicted Smoking Rate"
+  )
+
+p_income <- autoplot(pdp_income) +
+  labs(
+    title = "Income",
+    x = "Income (USD)",
+    y = "Predicted Smoking Rate"
+  )
+
+p_unemp <- autoplot(pdp_unemp) +
+  labs(
+    title = "Unemployment Rate",
+    x = "Unemployment Rate (%)",
+    y = "Predicted Smoking Rate"
+  )
+
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(patchwork)
+
+(p_binge | p_tobacco | p_income) /
+(p_unemp | p_age | plot_spacer()) +
+  theme(
+    plot.title = element_text(size = 11),
+    axis.title = element_text(size = 8),
+    axis.text  = element_text(size = 7)
+  ) +
+  plot_annotation(
+    title = "Graph 11: Partial Dependence Plots from Random Forest Model",
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  )
+
+```
+
+The partial dependence plot (Graph 11) serves as a machine learning robustness check by examining the relationship between smoking prevalence rate and key socioeconomic, demographic, and retail exposure variables while holding other covariates constant. The results indicate that several predictors exhibit clear nonlinear associations with smoking prevalence. In particular, unemployment rate shows a strong increasing pattern at lower levels before flattening out, while income and tobacco retail exposure display generally decreasing relationships with diminishing marginal effects. Binge drinking prevalence presents a nonlinear and less stable pattern, with stronger effects at higher levels and weaker variation at the lower end, suggesting heterogeneity in its marginal contribution. In contrast, the partial dependence plot for median age displays small and irregular fluctuations that resemble noise rather than a systematic pattern, suggesting that median age provides limited explanatory information for smoking prevalence in the machine learning framework.
+
+
+## 5. Conclusion
+
+This study combines spatial econometric models and machine learning diagnostics to examine the determinants of county-level smoking prevalence while explicitly accounting for spatial dependence. Spatial regression models, including SAR and CAR specifications, are used to model outcome spillover effects and spatially correlated unobserved factors across counties. Thus it effectively captured underlying spatial patterns in smoking prevalence. In addition, Random Forest is applied as a diagnostic tool to explore nonlinear relationships and variable importance. It illustrates how key predictors contribute to smoking prevalence beyond linear specifications, after controlling for spatial structure.
+
+Across both approaches, unemployment rate, income, and tobacco retail exposure emerge as key correlates of smoking prevalence, with unemployment showing a positive association and income and retail exposure displaying negative associations. Binge drinking prevalence exhibits a more complex and nonlinear relationship, while median age provides limited explanatory power once other socioeconomic and spatial factors are accounted for. Overall, the results highlight the importance of jointly considering spatial structure and socioeconomic conditions when analyzing geographic variation in smoking prevalence.
+data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAAbElEQVR4Xs2RQQrAMAgEfZgf7W9LAguybljJpR3wEse5JOL3ZObDb4x1loDhHbBOFU6i2Ddnw2KNiXcdAXygJlwE8OFVBHDgKrLgSInN4WMe9iXiqIVsTMjH7z/GhNTEibOxQswcYIWYOR/zAjBJfiXh3jZ6AAAAAElFTkSuQmCC
+Several limitations should be noted. First, the analysis cannot incorporate all factors that may influence smoking prevalence, and omitted variables such as environmental conditions and social norms cannot be observed or included in the models. What's more, the linear structure may restrict modelling for the spatial analysis. For the machine learning analysis, it do not explicitly model spatial relationships even accounting for the geographic locations.
+
+Future work could extend the spatial modeling framework by allowing for greater flexibility in functional form, for example through piecewise linear specifications or by integrating spatial econometric models with machine learning approaches. Such extensions would enable nonlinear relationships to be modelled while preserving explicit treatment of spatial dependence. In addition, assembling multi-year data would allow for the analysis of temporal trends in smoking prevalence and the evaluation of dynamic spatial patterns, with potential applications to forecasting. These directions underscore the broader importance of the research question, as understanding how socioeconomic conditions and spatial structure jointly shape smoking behavior remains essential for informing targeted public health interventions.
+
+
+## 6. Data Resources
+
+1. https://datagov-catalog-dev.app.cloud.gov/dataset/places-county-data-gis-friendly-format-2023-release 
+2. https://www.census.gov/geographies/mapping-files/2023/geo/tiger-line-file.html
+3. https://www.bea.gov/data/income-saving/personal-income-county-metro-and-other-areas
+4. https://data.ers.usda.gov/reports.aspx?ID=4038
+5. https://datacommons.org/tools/statvar
+6. https://www.kaggle.com/datasets/danofer/zipcodes-county-fips-crosswalk
+
+
+
